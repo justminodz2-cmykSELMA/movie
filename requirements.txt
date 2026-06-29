@@ -1,0 +1,13 @@
+flask
+flask-cors
+requests
+beautifulsoup4
+playwright
+yt-dlp
+fake-useragent
+google-generativeai
+pysrt
+pydub
+gradio-client
+gunicorn
+urllib3
