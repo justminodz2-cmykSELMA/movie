@@ -1,6 +1,6 @@
 
 
-# --- ملف: main.py (نسخة السيرفر الأونلاين - Production Ready) ---
+# --- ملف: main.py (النسخة النهائية الكاملة المدمجة مع الدبلجة الذكية وإصلاح MovieBox الدقيق والبروكسي الاحتياطي) ---
 
 # --- المكتبات الأساسية ---
 import sys
@@ -25,12 +25,17 @@ import uuid
 from flask import Flask, request, jsonify, Response, send_from_directory, url_for, stream_with_context
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
+try:
+    from pyngrok import ngrok
+except ImportError:
+    sys.stderr.write("WARN: pyngrok not installed. API will be local only. Run: pip install pyngrok\n")
+    ngrok = None
 
 # --- مكتبات التشغيل الآلي للمتصفح (لـ VeloraTV) ---
 try:
     from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 except ImportError:
-    sys.stderr.write("WARN: Playwright not installed. The 'veloratv' provider will not work.\n")
+    sys.stderr.write("WARN: Playwright not installed. The 'veloratv' provider will not work. Run: pip install playwright && playwright install\n")
     class PlaywrightTimeoutError(Exception): pass
     async_playwright = None
 
@@ -59,25 +64,23 @@ try:
 except (TypeError, AttributeError):
     pass
 
-# ----- الإعدادات العامة المتغيرة (Environment Variables) -----
+# ----- الإعدادات العامة -----
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
     'Accept': 'application/json',
     'Accept-Language': 'en-US,en;q=0.5'
 }
+# ===================================================================
+# ✨✨✨ ضع مفتاح Gemini API الخاص بك هنا لتفعيل الدبلجة الذكية ✨✨✨
+# ===================================================================
+GEMINI_API_KEY = "AIzaSy...YOUR_API_KEY_HERE" # <--- غير هذا المفتاح
 
-# جلب مفتاح Gemini من إعدادات السيرفر
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-
-# جلب رابط سيرفر TMDB (CinePro) من إعدادات السيرفر (بدلاً من localhost)
-TMDB_BACKEND_URL = os.environ.get("TMDB_BACKEND_URL", "http://localhost:3000")
-
-if GEMINI_AVAILABLE and GEMINI_API_KEY:
+if GEMINI_AVAILABLE and GEMINI_API_KEY and "YOUR_API_KEY" not in GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         sys.stderr.write("INFO: Gemini AI configured successfully.\n")
     except Exception as e:
-        sys.stderr.write(f"WARN: Failed to configure Gemini AI. Error: {e}\n")
+        sys.stderr.write(f"WARN: Failed to configure Gemini AI. It will be disabled. Error: {e}\n")
         GEMINI_AVAILABLE = False
 else:
     GEMINI_AVAILABLE = False
@@ -87,6 +90,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- دالة مساعدة لتنسيق حجم الملف ---
 def format_bytes(size_bytes):
+    """يحول حجم الملف بالبايت إلى صيغة مقروءة (KB, MB, GB)."""
     if size_bytes is None: return None
     try:
         size_bytes = int(size_bytes)
@@ -115,6 +119,7 @@ def akwam_make_request(url):
 
 def select_best_match_with_gemini(user_query, media_type, target_season, all_results):
     if not GEMINI_AVAILABLE:
+        sys.stderr.write("INFO: AKWAM-LOG: Gemini AI not available. Selecting the first search result as a fallback.\n")
         return all_results[0] if all_results else None
     model = genai.GenerativeModel('gemini-1.5-flash')
     formatted_results = "\n".join([f"id:{i}, title:\"{res['title']}\", url:\"{res['url']}\"" for i, res in enumerate(all_results)])
@@ -136,10 +141,12 @@ Output: MUST be a single JSON object with the ID. Example: {{"best_choice_id": <
         decision = json.loads(json_text)
         best_id = int(decision.get('best_choice_id'))
         if 0 <= best_id < len(all_results):
-            return all_results[best_id]
-        else: raise ValueError(f"Invalid ID: {best_id}")
+            chosen = all_results[best_id]
+            sys.stderr.write(f"INFO: AKWAM-LOG: Gemini AI chose: ID {best_id}, Title \"{chosen['title']}\"\n")
+            return chosen
+        else: raise ValueError(f"Gemini returned an invalid ID: {best_id}")
     except Exception as e:
-        sys.stderr.write(f"ERROR: AKWAM-LOG: Gemini analysis failed: {e}\n")
+        sys.stderr.write(f"ERROR: AKWAM-LOG: Gemini analysis failed: {e}. Falling back to the first result.\n")
         return all_results[0] if all_results else None
 
 def akwam_get_video_links_from_player(content_page_url):
@@ -186,6 +193,7 @@ def akwam_find_episode_on_season_page(season_url, episode_number):
     return found_episode['url'] if found_episode else None
 
 def scrape_akwam(query, media_type, season_num, episode_num):
+    sys.stderr.write(f"[*] AKWAM-LOG: Starting scrape for '{query}'...\n")
     AKWAM_BASE_URL = "https://ak.sv"
     search_query_encoded = urllib.parse.quote_plus(query)
     all_search_results, current_page = [], 1
@@ -226,18 +234,25 @@ async def velora_extract_links_from_url(url: str, context):
         if VELORA_M3U8_PATTERN.search(req.url): m3u8_links.add(req.url)
         if VELORA_SUBTITLE_PATTERN.search(req.url): subtitle_links.add(req.url)
     page.on("request", handle_request)
+    sys.stderr.write(f"[] VELORA-LOG: Navigating to page {url}\n")
     try:
         await page.goto(url, timeout=60000, wait_until='domcontentloaded')
         await page.wait_for_selector("div.player-servers, iframe", timeout=15000)
         servers_to_try = ["Alpha", "Bravo", "Charlie"]
         for server in servers_to_try:
             try:
+                sys.stderr.write(f"[] VELORA-LOG: Trying server '{server}'...\n")
                 await page.get_by_text(server, exact=True).click(timeout=5000)
                 await page.wait_for_timeout(3000)
-                if m3u8_links: break
-            except Exception: pass
-    except Exception: pass
-    finally: await page.close()
+                if m3u8_links:
+                    sys.stderr.write(f"[*] VELORA-LOG: Success! Found m3u8 link(s) from server '{server}'.\n")
+                    break
+            except Exception as e:
+                sys.stderr.write(f"[!] VELORA-LOG: Error with server '{server}': {e}\n")
+    except Exception as e:
+        sys.stderr.write(f"[!] VELORA-LOG: Failed during page navigation: {e}\n")
+    finally:
+        await page.close()
     return m3u8_links, subtitle_links
 
 async def velora_async_main(watch_url):
@@ -274,6 +289,7 @@ def aflam_get_best_match(query, results):
 def aflam_get_video_servers(content_url, session):
     links = []
     try:
+        sys.stderr.write(f"[] AFLAM-LOG: Getting servers from {content_url}\n")
         post_headers = HEADERS.copy()
         post_headers['Referer'] = content_url
         response = session.post(content_url, headers=post_headers, data={'watch': '1'}, timeout=20)
@@ -286,26 +302,32 @@ def aflam_get_video_servers(content_url, session):
             if not encoded_url: continue
             try:
                 iframe_src = base64.b64decode(encoded_url).decode('utf-8')
+                sys.stderr.write(f"[] AFLAM-LOG: Processing server iframe: {iframe_src}\n")
                 command = ['yt-dlp', '-g', '--no-warnings', iframe_src]
                 result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', timeout=45)
                 direct_link = result.stdout.strip().split('\n')[0]
                 if direct_link.startswith('http'):
                     links.append({"quality": "Direct MP4", "url": direct_link, "needs_proxy": False})
             except Exception: pass
-    except requests.exceptions.RequestException: pass
+    except requests.exceptions.RequestException as e:
+        sys.stderr.write(f"[!] AFLAM-LOG: Network error getting servers: {e}\n")
     return links
 
 def aflam_handle_series(page_soup, episode_num, session):
+    sys.stderr.write(f"[] AFLAM-LOG: Looking for episode number {episode_num}\n")
     episode_links = page_soup.select('div.EpisodesArea div.bg-primary2 h2 a')
     episode_pattern = re.compile(r'(?:الحلقة|حلقة)\s(\d+)')
     for link_tag in episode_links:
         title = link_tag.get_text(strip=True)
         match = episode_pattern.search(title)
         if match and int(match.group(1)) == episode_num:
+            sys.stderr.write(f"[*] AFLAM-LOG: Found match: '{title}' -> {link_tag['href']}\n")
             return aflam_get_video_servers(link_tag['href'], session)
+    sys.stderr.write(f"[!] AFLAM-LOG: Episode {episode_num} not found in the list.\n")
     return []
 
 def scrape_aflam(query, media_type, episode_num):
+    sys.stderr.write(f"[*] AFLAM-LOG: Starting scrape for '{query}'...\n")
     AFLAM_BASE_URL = "https://afllam.onl"
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -321,6 +343,7 @@ def scrape_aflam(query, media_type, episode_num):
             link_tag = entry.select_one('h3.entry-title a')
             if link_tag and link_tag.has_attr('href'):
                 results_map[link_tag.text.strip()] = link_tag['href']
+        if not results_map: return {"status": "error", "message": "Could not parse search results on Aflam.onl."}
         best_match = aflam_get_best_match(query, results_map)
         if not best_match: return {"status": "error", "message": "No close match found in search results on Aflam.onl."}
         page_url = best_match['url']
@@ -347,14 +370,17 @@ def risto_extract_stream_link(embed_url, referer_url):
     if not embed_url or not referer_url: return None
     command = ['yt-dlp', '-g', '--referer', referer_url, embed_url]
     try:
+        sys.stderr.write(f"[*] RISTO-LOG: Running yt-dlp on {embed_url}\n")
         result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', timeout=60)
         stream_links = result.stdout.strip().split('\n')
         for link in reversed(stream_links):
             if "m3u8" in link or "mp4" in link: return link
-    except Exception: pass
+    except Exception as e:
+        sys.stderr.write(f"[!] RISTO-LOG: yt-dlp failed: {e}\n")
     return None
 
 def scrape_ristoanime(query, season_num, episode_num):
+    sys.stderr.write(f"[] RISTO-LOG: Starting scrape for '{query}' S{season_num}E{episode_num}\n")
     RISTO_BASE_URL = "https://ristoanime.org"
     RISTO_AJAX_URL = f"{RISTO_BASE_URL}/wp-content/themes/TopAnime/Ajaxt/Single/Episodes.php"
     session = requests.Session()
@@ -367,6 +393,7 @@ def scrape_ristoanime(query, season_num, episode_num):
         search_results = soup.select('div.MovieItem a')
         if not search_results: return {"status": "error", "message": "Anime not found on Ristoanime."}
         series_url = search_results[0]['href']
+        sys.stderr.write(f"[] RISTO-LOG: Found anime page: {series_url}\n")
         res = session.get(series_url, timeout=15)
         res.raise_for_status()
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -377,6 +404,7 @@ def scrape_ristoanime(query, season_num, episode_num):
         if season_tabs:
             for tab in season_tabs:
                 if target_season_name_pattern.search(tab.get_text(strip=True)):
+                    sys.stderr.write(f"[] RISTO-LOG: Found season {season_num}, fetching episodes via AJAX.\n")
                     payload = {'season': tab['data-season']}
                     ajax_res = session.post(RISTO_AJAX_URL, data=payload, timeout=15)
                     ajax_res.raise_for_status()
@@ -387,6 +415,7 @@ def scrape_ristoanime(query, season_num, episode_num):
             episode_list_element = soup.select_one('div.EpisodesList')
             if episode_list_element:
                 episodes_html = str(episode_list_element)
+                sys.stderr.write(f"[] RISTO-LOG: Using main episode list for season {season_num}.\n")
         if not episodes_html: return {"status": "error", "message": f"Could not find season {season_num}."}
         episodes_soup = BeautifulSoup(episodes_html, 'html.parser')
         episode_links = episodes_soup.select('a')
@@ -396,8 +425,9 @@ def scrape_ristoanime(query, season_num, episode_num):
             match = episode_pattern.search(link.get_text(strip=True))
             if match and int(match.group(1)) == episode_num:
                 episode_url = link['href']
+                sys.stderr.write(f"[] RISTO-LOG: Found episode {episode_num} link: {episode_url}\n")
                 break
-        if not episode_url: return {"status": "error", "message": f"Could not find episode {episode_num}."}
+        if not episode_url: return {"status": "error", "message": f"Could not find episode {episode_num} in season {season_num}."}
         watch_page_url = episode_url.strip('/') + '/watch/'
         res = session.get(watch_page_url, timeout=15)
         res.raise_for_status()
@@ -434,16 +464,19 @@ def atoons_create_robust_session():
     return session
 
 def atoons_fetch_via_worker(session, url_to_fetch):
+    sys.stderr.write(f"[*] ATOONS-LOG: Fetching via Worker: {url_to_fetch[:70]}...\n")
     try:
         response = session.get(ATOONS_WORKER_URL, params={"url": url_to_fetch}, timeout=20)
         response.raise_for_status()
         response.encoding = 'utf-8'
         return response.text
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        sys.stderr.write(f"[!] ATOONS-LOG: Worker fetch failed: {e}\n")
         return None
 
 def atoons_get_m3u8_direct(session, episode_path):
     episode_url = ATOONS_BASE_URL + episode_path
+    sys.stderr.write(f"[] ATOONS-LOG: Fetching direct: {episode_url[:70]}...\n")
     try:
         resp = session.get(episode_url, timeout=20)
         resp.raise_for_status()
@@ -457,7 +490,8 @@ def atoons_get_m3u8_direct(session, episode_path):
             if all(k in parts for k in ("jC1kO", "hF3nV", "iA5pX", "tN4qY")):
                 return f"{parts['jC1kO']}://{parts['hF3nV']}/{parts['iA5pX']}?{parts['tN4qY']}"
         return None
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        sys.stderr.write(f"[!] ATOONS-LOG: Direct fetch failed: {e}\n")
         return None
 
 def atoons_select_best_season_match(query, season_num, search_results):
@@ -474,6 +508,7 @@ def atoons_select_best_season_match(query, season_num, search_results):
                 similarity_score += 1.0
         elif season_num == 1:
             similarity_score += 0.8
+        sys.stderr.write(f"[*] ATOONS-LOG: Evaluating '{title}' -> Score: {similarity_score:.2f}\n")
         if similarity_score > best_match['score']:
             best_match['score'] = similarity_score
             best_match['path'] = path
@@ -481,6 +516,7 @@ def atoons_select_best_season_match(query, season_num, search_results):
     return best_match
 
 def scrape_arabic_toons(query, season_num, episode_num):
+    sys.stderr.write(f"[*] ATOONS-LOG: Starting scrape for '{query}' S{season_num}E{episode_num}\n")
     session = atoons_create_robust_session()
     search_url = f"{ATOONS_BASE_URL}livesearch.php?q={urllib.parse.quote(query)}"
     search_html = atoons_fetch_via_worker(session, search_url)
@@ -494,6 +530,7 @@ def scrape_arabic_toons(query, season_num, episode_num):
     if not best_match['path']:
         return {"status": "error", "message": f"Could not find a matching result for Season {season_num}."}
     selected_anime_path = best_match['path']
+    sys.stderr.write(f"[*] ATOONS-LOG: Auto-selected best match: '{best_match['title']}' (Score: {best_match['score']:.2f})\n")
     anime_url = ATOONS_BASE_URL + selected_anime_path
     episodes_html = atoons_fetch_via_worker(session, anime_url)
     if not episodes_html:
@@ -512,6 +549,7 @@ def scrape_arabic_toons(query, season_num, episode_num):
         match = episode_pattern.search(name_text)
         if match and int(match.group(1)) == episode_num:
             selected_episode_path = link_tag['href']
+            sys.stderr.write(f"[*] ATOONS-LOG: Found episode {episode_num} link.\n")
             break
     if not selected_episode_path:
         return {"status": "error", "message": f"Could not find episode number {episode_num} for this series."}
@@ -535,6 +573,7 @@ SUBTITLES_HEADERS = {
 }
 
 def get_subtitles_from_wyzie(content_type, tmdb_id, season=None, episode=None):
+    sys.stderr.write(f"[*] SUBTITLES-LOG: Starting subtitle search for TMDB ID {tmdb_id}\n")
     if content_type == "movie":
         url = f"https://sub.wyzie.ru/search?id={tmdb_id}&format=srt"
     elif content_type == "tv":
@@ -545,8 +584,10 @@ def get_subtitles_from_wyzie(content_type, tmdb_id, season=None, episode=None):
         resp = requests.get(url, headers=SUBTITLES_HEADERS, timeout=15)
         resp.raise_for_status()
         data = resp.json() if 'application/json' in resp.headers.get('content-type', '') else resp.text
+        sys.stderr.write(f"[*] SUBTITLES-LOG: Successfully fetched subtitles. Status: {resp.status_code}\n")
         return {"status": "success", "requested_url": url, "response_data": data}
     except requests.exceptions.RequestException as e:
+        sys.stderr.write(f"[!] SUBTITLES-LOG: Request failed: {e}\n")
         return {"status": "error", "message": f"Failed to fetch subtitles: {e}"}
 
 # ==============================================================================
@@ -554,6 +595,7 @@ def get_subtitles_from_wyzie(content_type, tmdb_id, season=None, episode=None):
 # ==============================================================================
 
 def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
+    sys.stderr.write(f"[*] TMDB-LOG: Starting scrape for TMDB ID {tmdb_id}...\n")
     if media_type == 'movie': endpoint = f"{TMDB_BACKEND_URL}/movie/{tmdb_id}"
     elif media_type == 'series':
         if not season or not episode: return {"status": "error", "message": "Season and episode are required for series"}
@@ -563,18 +605,23 @@ def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
         session = requests.Session()
         session.headers.update({'User-Agent': HEADERS['User-Agent'], 'Accept': 'application/json', 'Connection': 'keep-alive'})
         session.mount('http://', HTTPAdapter(max_retries=3))
+        sys.stderr.write(f"[*] TMDB-LOG: Connecting to {endpoint}...\n")
         response = session.get(endpoint, timeout=60, verify=False)
         response.raise_for_status()
+        sys.stderr.write(f"[*] TMDB-LOG: Response received, status: {response.status_code}\n")
         data = response.json()
         if 'files' not in data or not data['files']: return {"status": "error", "message": "No media files found from TMDB provider"}
         links = [{"quality": "Direct MP4" if f['type'] == 'mp4' else "HLS Stream", "url": f['file'], "needs_proxy": False, "language": f.get('lang', 'en')} for f in data['files']]
         result = {"status": "success", "links": links}
         if 'subtitles' in data and data['subtitles']:
             result["subtitles"] = [{"lang": s.get('lang', 'en'), "url": s['url'], "type": s.get('type', 'srt')} for s in data['subtitles']]
+        sys.stderr.write(f"[*] TMDB-LOG: Successfully extracted {len(links)} links\n")
         return result
     except requests.exceptions.RequestException as e:
-        return {"status": "error", "message": f"Connection error: CinePro Backend is not accessible. Error: {e}"}
+        sys.stderr.write(f"[!] TMDB-LOG: Connection error to {endpoint}: {e}\n")
+        return {"status": "error", "message": "Connection error: CinePro Backend is not accessible. Error."}
     except Exception as e:
+        sys.stderr.write(f"[!] TMDB-LOG: Unexpected error: {e}\n")
         return {"status": "error", "message": f"TMDB provider error: {e}"}
 
 # ==============================================================================
@@ -1067,3 +1114,4 @@ def scrape_endpoint():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
