@@ -1,4 +1,5 @@
 
+
 # --- ملف: main.py (نسخة السيرفر الأونلاين - Production Ready) ---
 
 # --- المكتبات الأساسية ---
@@ -580,7 +581,10 @@ def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
 # ========================   PROVIDER 8: MOVIEBOX   ============================
 # ==============================================================================
 def scrape_moviebox(query, media_type, season_num, episode_num):
+    sys.stderr.write(f"[*] MOVIEBOX-LOG: Starting scrape for '{query}'...\n")
     session = requests.Session()
+    
+    # 1. البحث في صفحة الويب
     search_url = f"https://moviebox.ph/web/searchResult?keyword={urllib.parse.quote_plus(query)}"
     headers = {
         'User-Agent': HEADERS['User-Agent'],
@@ -589,6 +593,7 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
     }
     
     try:
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Searching HTML at {search_url}\n")
         res = session.get(search_url, headers=headers, timeout=15)
         res.raise_for_status()
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -605,14 +610,17 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
                 path = card.get('href').split('/')[-1] 
                 results_map[title] = path
 
+        # --- بداية التصليح الدقيق لاختيار أفضل تطابق ---
         best_title = None
         detail_path = None
         query_lower = query.lower().strip()
 
+        # استبعاد النسخ الفرنسية ما لم تكن مطلوبة بشكل صريح
         filtered_results = {k: v for k, v in results_map.items() if "française" not in k.lower()}
         if not filtered_results:
             filtered_results = results_map
 
+        # أ. إذا كان مسلسل، نبحث عن الموسم المحدد بالضبط (مثل The Rookie S1)
         if media_type == 'series' and season_num:
             target_s = f"{query_lower} s{season_num}"
             for t, p in filtered_results.items():
@@ -621,6 +629,7 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
                     detail_path = p
                     break
 
+        # ب. إذا كان مسلسل ولم نجد الموسم وحده، نبحث عن حزمة مواسم (مثل From S1-S4)
         if not best_title and media_type == 'series':
             for t, p in filtered_results.items():
                 if query_lower in t.lower() and re.search(r's\d+-s\d+', t.lower()):
@@ -628,6 +637,7 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
                     detail_path = p
                     break
 
+        # ج. البحث عن تطابق دقيق للاسم
         if not best_title:
             for t, p in filtered_results.items():
                 if t.lower() == query_lower:
@@ -635,6 +645,7 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
                     detail_path = p
                     break
 
+        # د. استخدام difflib كحل أخير بـ cutoff عالي لعدم اختيار أفلام خاطئة (مثل Inception -> In the Grey)
         if not best_title:
             best_matches = difflib.get_close_matches(query_lower, [k.lower() for k in filtered_results.keys()], n=1, cutoff=0.6)
             if best_matches:
@@ -645,29 +656,39 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
                         detail_path = p
                         break
             else:
+                # إذا لم نجد أي تطابق جيد، نأخذ النتيجة الأولى فقط إذا كان فيها جزء من الكلمة
                 for t, p in filtered_results.items():
                     if query_lower in t.lower() or t.lower() in query_lower:
                         best_title = t
                         detail_path = p
                         break
-                if not best_title:
+                if not best_title: # الملاذ الأخير
                     best_title = list(filtered_results.keys())[0]
                     detail_path = filtered_results[best_title]
+        # --- نهاية التصليح ---
+
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Found best match: '{best_title}' (Path: {detail_path})\n")
+
     except Exception as e:
         return {"status": "error", "message": f"MovieBox: HTML Search failed. {e}"}
 
+    # 2. الحصول على subjectId من واجهة التفاصيل
     subject_id = None
     try:
         detail_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/detail?detailPath={detail_path}"
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching details to get subjectId...\n")
+        
         api_headers = {
             'User-Agent': HEADERS['User-Agent'],
             'Accept': 'application/json',
             'Origin': 'https://netfilm.world',
             'Referer': 'https://netfilm.world/'
         }
+        
         detail_res = session.get(detail_api_url, headers=api_headers, timeout=15)
         detail_res.raise_for_status()
         
+        # التقاط أي cookies جديدة
         if detail_res.cookies:
             session.cookies.update(detail_res.cookies)
             
@@ -675,9 +696,13 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
 
         if not subject_id:
             return {"status": "error", "message": "MovieBox: Failed to get subjectId from detail API."}
+            
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Got subjectId: {subject_id}\n")
+        
     except Exception as e:
         return {"status": "error", "message": f"MovieBox: Detail fetch failed. {e}"}
 
+    # 3. الحصول على روابط البث (play)
     links = []
     stream_id_for_subs = None
     try:
@@ -685,6 +710,8 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         ep = episode_num if media_type == 'series' and episode_num else 0
 
         play_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching play streams for S{se}E{ep}...\n")
+        
         play_headers = {
              'User-Agent': HEADERS['User-Agent'],
              'Accept': 'application/json',
@@ -696,7 +723,9 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         play_res.raise_for_status()
         data = play_res.json().get('data', {})
         
+        # --- تحديث: إذا فشل جلب المسلسل بموسم معين (لأنه منفصل)، نجرب بـ se=0 ---
         if (not data or not data.get('hasResource') or (not data.get('dash') and not data.get('streams') and not data.get('hls'))) and media_type == 'series':
+             sys.stderr.write(f"[*] MOVIEBOX-LOG: No streams found for S{se}E{ep}. Falling back to se=0 (standalone season mode)...\n")
              se = 0
              play_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
              play_res = session.get(play_api_url, headers=play_headers, timeout=15)
@@ -721,13 +750,16 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
 
         if not links:
             return {"status": "error", "message": "MovieBox: No valid stream URLs were extracted."}
+
     except Exception as e:
         return {"status": "error", "message": f"MovieBox: Play API fetch failed. {e}"}
 
+    # 4. الحصول على الترجمات
     all_subtitles = []
     if stream_id_for_subs:
         try:
             sub_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/caption?format=MP4&id={stream_id_for_subs}&subjectId={subject_id}&detailPath={detail_path}"
+            sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching subtitles...\n")
             sub_res = session.get(sub_api_url, headers=api_headers, timeout=15)
             if sub_res.status_code == 200:
                 for cap in sub_res.json().get('data', {}).get('captions', []):
@@ -739,7 +771,9 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
     final_result = {"status": "success", "links": links}
     if all_subtitles:
         final_result["subtitles"] = all_subtitles
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Found and added {len(all_subtitles)} subtitle(s).\n")
 
+    sys.stderr.write(f"[*] MOVIEBOX-LOG: Successfully returned {len(links)} link(s).\n")
     return final_result
 
 # ==============================================================================
@@ -751,6 +785,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 tts_client = None
 try:
     tts_client = Client("NihalGazi/Text-To-Speech-Unlimited")
+    sys.stderr.write("✅ [DUBBING-LOG] Connected to Text-To-Speech service successfully.\n")
 except Exception as e:
     sys.stderr.write(f"❌ [DUBBING-LOG] Failed to connect to Text-To-Speech service: {e}\n")
 
@@ -828,21 +863,26 @@ def tts_generate_line(text, voice_name, out_path, emotion="neutral", retries=5):
     if not tts_client: raise ConnectionError("TTS client is not available.")
     for attempt in range(1, retries + 1):
         try:
+            sys.stderr.write(f"🎙️ [{voice_name}] Generating audio... (Attempt {attempt}/{retries})\n")
+            
+            # === التعديل هنا: إرسال المتغيرات بالترتيب المباشر (Positional Arguments) ===
             audio_path, _ = tts_client.predict(
-                text,           
-                voice_name,     
-                emotion,        
-                True,           
-                12345,          
-                "",             
+                text,           # 1. prompt
+                voice_name,     # 2. voice
+                emotion,        # 3. emotion
+                True,           # 4. use_random_seed
+                12345,          # 5. specific_seed
+                "",             # 6. api_key_input
                 api_name="/text_to_speech_app"
             )
             
-            if not audio_path: raise Exception("API failed to create an audio file.")
+            if not audio_path: raise Exception("API failed to create an audio file (returned None).")
             os.rename(audio_path, out_path)
             return tts_compress_mp3(out_path, bitrate="64k")
         except Exception as e:
+            sys.stderr.write(f"⚠️ [DUBBING-LOG] Error on attempt {attempt} for voice [{voice_name}]: {e}\n")
             time.sleep(3 * attempt)
+    sys.stderr.write(f"❌ [DUBBING-LOG] Failed to generate audio after {retries} attempts for: {text[:30]}...\n")
     return None
 
 def tts_process_line(i, sub, voice_name, job_dir):
@@ -851,9 +891,10 @@ def tts_process_line(i, sub, voice_name, job_dir):
         if result_path := tts_generate_line(sub.text, voice_name, out_file):
             start_ms = tts_to_milliseconds(sub.start)
             end_ms = tts_to_milliseconds(sub.end)
+            sys.stderr.write(f"✅ [{voice_name}] {sub.text.replace(chr(10), ' ')} ({sub.start} → {sub.end})\n")
             return {"file_path": result_path, "start_ms": start_ms, "end_ms": end_ms, "text": sub.text}
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write(f"❌ [DUBBING-LOG] Error processing line {sub.index}: {e}\n")
     return None
 
 # ==============================================================================
@@ -870,8 +911,10 @@ def dub_srt_endpoint():
 
     job_id, job_dir = str(uuid.uuid4()), os.path.join(OUTPUT_DIR, str(uuid.uuid4()))
     os.makedirs(job_dir)
+    sys.stderr.write(f"\n🎬 Starting new dubbing job: {job_id}\n")
 
     try:
+        sys.stderr.write(f"📥 Downloading subtitles from: {srt_url}\n")
         response = requests.get(srt_url, timeout=20)
         response.raise_for_status()
         srt_content = response.text
@@ -880,9 +923,11 @@ def dub_srt_endpoint():
         return jsonify({"error": f"Failed to download or parse subtitle file: {e}"}), 500
 
     voice_assignments = []
+    sys.stderr.write("🧠 [DUBBING-LOG] Attempting to analyze dialogue with Gemini for smart voice assignment...\n")
     dialogue_analysis = analyze_dialogue_with_gemini(srt_content)
 
     if dialogue_analysis and 'dialogue_analysis' in dialogue_analysis:
+        sys.stderr.write("✅ [DUBBING-LOG] Gemini analysis successful! Assigning consistent voices to speakers.\n")
         speaker_to_voice_map = {}
         male_pool = male_voices[:]
         female_pool = female_voices[:]
@@ -906,11 +951,13 @@ def dub_srt_endpoint():
             
             voice_assignments.append(speaker_to_voice_map[speaker_id])
     else:
+        sys.stderr.write("⚠️ [DUBBING-LOG] Gemini analysis failed or unavailable. Falling back to simple alternating voices.\n")
         voice_assignments = [male_voices[i % len(male_voices)] if i % 2 == 0 else female_voices[i % len(female_voices)] for i in range(len(subs))]
 
     def generate_stream():
         total = len(subs)
         batch, completed = [], 0
+        sys.stderr.write(f"🚀 Starting parallel processing (up to 8 workers)...\n")
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(tts_process_line, i, sub, voice_assignments[i], job_dir): i for i, sub in enumerate(subs)}
             for future in concurrent.futures.as_completed(futures):
@@ -924,6 +971,7 @@ def dub_srt_endpoint():
                         yield json.dumps({"batch": batch, "progress": f"{completed}/{total}"}, ensure_ascii=False) + "\n"
                         batch.clear()
             if batch: yield json.dumps({"batch": batch, "progress": f"{completed}/{total}"}, ensure_ascii=False) + "\n"
+        sys.stderr.write(f"\n✅ Job {job_id} completed — {completed} audio files generated.\n")
     return Response(stream_with_context(generate_stream()), mimetype='application/json')
 
 @app.route('/audio/<job_id>/<filename>')
@@ -1015,15 +1063,7 @@ def scrape_endpoint():
                 link_item['url'] = f"{api_base_url}/proxy?url={quote_plus(original_url)}"
                 del link_item["needs_proxy"]
     return jsonify(result), 200 if result.get('status') == 'success' else 404
-@app.route("/")
-def index():
-    return {
-        "status": "online",
-        "message": "API running"
-    }
-@app.route("/health")
-def health():
-    return "OK", 200
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
