@@ -20,6 +20,14 @@ import time
 import concurrent.futures
 import uuid
 
+# --- محاولة استيراد cloudscraper لتجاوز حماية Cloudflare في MovieBox ---
+try:
+    import cloudscraper
+    CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    CLOUDSCRAPER_AVAILABLE = False
+    sys.stderr.write("WARN: cloudscraper not installed. MovieBox might face 403 errors. Run: pip install cloudscraper\n")
+
 # --- مكتبات الـ API والبروكسي ---
 from flask import Flask, request, jsonify, Response, send_from_directory, url_for, stream_with_context
 from flask_cors import CORS
@@ -282,7 +290,9 @@ def aflam_get_best_match(query, results):
     titles = list(results.keys())
     best_matches = difflib.get_close_matches(query, titles, n=1, cutoff=0.5)
     if best_matches:
-        return {'title': best_matches[0], 'url': results[best_matches[0]]}
+        best_title = best_matches[0]
+        sys.stderr.write(f"[*] AFLAM-LOG: Best match for '{query}' is '{best_title}'\n")
+        return {'title': best_title, 'url': results[best_title]}
     return None
 
 def aflam_get_video_servers(content_url, session):
@@ -307,7 +317,8 @@ def aflam_get_video_servers(content_url, session):
                 direct_link = result.stdout.strip().split('\n')[0]
                 if direct_link.startswith('http'):
                     links.append({"quality": "Direct MP4", "url": direct_link, "needs_proxy": False})
-            except Exception: pass
+            except Exception as e:
+                sys.stderr.write(f"[!] AFLAM-LOG: Failed to process a server: {e}\n")
     except requests.exceptions.RequestException as e:
         sys.stderr.write(f"[!] AFLAM-LOG: Network error getting servers: {e}\n")
     return links
@@ -595,10 +606,10 @@ def get_subtitles_from_wyzie(content_type, tmdb_id, season=None, episode=None):
 
 def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
     sys.stderr.write(f"[*] TMDB-LOG: Starting scrape for TMDB ID {tmdb_id}...\n")
-    if media_type == 'movie': endpoint = f"{TMDB_BACKEND_URL}/movie/{tmdb_id}"
+    if media_type == 'movie': endpoint = f"http://localhost:3000/movie/{tmdb_id}"
     elif media_type == 'series':
         if not season or not episode: return {"status": "error", "message": "Season and episode are required for series"}
-        endpoint = f"{TMDB_BACKEND_URL}/tv/{tmdb_id}?s={season}&e={episode}"
+        endpoint = f"http://localhost:3000/tv/{tmdb_id}?s={season}&e={episode}"
     else: return {"status": "error", "message": "Invalid media type. Use 'movie' or 'series'"}
     try:
         session = requests.Session()
@@ -617,8 +628,8 @@ def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
         sys.stderr.write(f"[*] TMDB-LOG: Successfully extracted {len(links)} links\n")
         return result
     except requests.exceptions.RequestException as e:
-        sys.stderr.write(f"[!] TMDB-LOG: Connection error to {endpoint}: {e}\n")
-        return {"status": "error", "message": "Connection error: CinePro Backend is not accessible. Error."}
+        sys.stderr.write(f"[!] TMDB-LOG: Connection error to localhost:3000: {e}\n")
+        return {"status": "error", "message": "Connection error: CinePro Backend is not accessible on port 3000. Please ensure it's running."}
     except Exception as e:
         sys.stderr.write(f"[!] TMDB-LOG: Unexpected error: {e}\n")
         return {"status": "error", "message": f"TMDB provider error: {e}"}
@@ -628,7 +639,13 @@ def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
 # ==============================================================================
 def scrape_moviebox(query, media_type, season_num, episode_num):
     sys.stderr.write(f"[*] MOVIEBOX-LOG: Starting scrape for '{query}'...\n")
-    session = requests.Session()
+    
+    # اختيار الجلسة الأفضل (cloudscraper إذا توفر لتجاوز الحماية، وإلا requests العادية)
+    if CLOUDSCRAPER_AVAILABLE:
+        session = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
+    else:
+        session = requests.Session()
+        session.headers.update(HEADERS)
     
     # 1. البحث في صفحة الويب
     search_url = f"https://moviebox.ph/web/searchResult?keyword={urllib.parse.quote_plus(query)}"
@@ -691,7 +708,7 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
                     detail_path = p
                     break
 
-        # د. استخدام difflib كحل أخير بـ cutoff عالي لعدم اختيار أفلام خاطئة (مثل Inception -> In the Grey)
+        # د. استخدام difflib كحل أخير بـ cutoff عالي لعدم اختيار أفلام خاطئة
         if not best_title:
             best_matches = difflib.get_close_matches(query_lower, [k.lower() for k in filtered_results.keys()], n=1, cutoff=0.6)
             if best_matches:
@@ -726,15 +743,15 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         
         api_headers = {
             'User-Agent': HEADERS['User-Agent'],
-            'Accept': 'application/json',
-            'Origin': 'https://netfilm.world',
-            'Referer': 'https://netfilm.world/'
+            'Accept': 'application/json, text/plain, */*',
+            'Origin': 'https://moviebox.ph',
+            'Referer': f'https://moviebox.ph/web/moviedetail/{detail_path}',
+            'x-client-info': '{"timezone":"Africa/Casablanca"}'
         }
         
         detail_res = session.get(detail_api_url, headers=api_headers, timeout=15)
         detail_res.raise_for_status()
         
-        # التقاط أي cookies جديدة
         if detail_res.cookies:
             session.cookies.update(detail_res.cookies)
             
@@ -748,33 +765,51 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
     except Exception as e:
         return {"status": "error", "message": f"MovieBox: Detail fetch failed. {e}"}
 
-    # 3. الحصول على روابط البث (play)
+    # 3. الحصول على روابط البث (play) مع معالجة حماية Cloudflare عبر الـ Proxy
     links = []
     stream_id_for_subs = None
     try:
         se = season_num if media_type == 'series' and season_num else 0
         ep = episode_num if media_type == 'series' and episode_num else 0
 
-        play_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+        play_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
         sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching play streams for S{se}E{ep}...\n")
         
         play_headers = {
              'User-Agent': HEADERS['User-Agent'],
-             'Accept': 'application/json',
-             'Origin': 'https://netfilm.world',
-             'Referer': f'https://netfilm.world/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&detailSe=&detailEp=&lang=en&type=/movie/detail'
+             'Accept': 'application/json, text/plain, */*',
+             'Origin': 'https://moviebox.ph',
+             'Referer': f'https://moviebox.ph/web/moviedetail/{detail_path}',
+             'x-client-info': 'web',
+             'sec-fetch-site': 'same-site',
+             'sec-fetch-mode': 'cors'
         }
-        
+
+        # محاولة أولى مباشرة
         play_res = session.get(play_api_url, headers=play_headers, timeout=15)
-        play_res.raise_for_status()
+        
+        # إذا رفض السيرفر الطلب (403 مثلاً)، نلجأ للبروكسي الاحتياطي الذكي
+        if play_res.status_code != 200:
+            sys.stderr.write(f"[*] MOVIEBOX-LOG: Direct play fetch failed ({play_res.status_code}). Trying Fallback Proxy...\n")
+            proxy_url = f"https://12spapi.fly.dev/proxy?url={quote_plus(play_api_url)}"
+            # نرسل الهيدرز المطلوبة داخل الـ Headers العادية، والبروكسي سيقوم بتمريرها
+            play_res = session.get(proxy_url, headers=play_headers, timeout=20)
+            play_res.raise_for_status()
+
         data = play_res.json().get('data', {})
         
         # --- تحديث: إذا فشل جلب المسلسل بموسم معين (لأنه منفصل)، نجرب بـ se=0 ---
         if (not data or not data.get('hasResource') or (not data.get('dash') and not data.get('streams') and not data.get('hls'))) and media_type == 'series':
              sys.stderr.write(f"[*] MOVIEBOX-LOG: No streams found for S{se}E{ep}. Falling back to se=0 (standalone season mode)...\n")
              se = 0
-             play_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+             play_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
              play_res = session.get(play_api_url, headers=play_headers, timeout=15)
+             
+             if play_res.status_code != 200:
+                 sys.stderr.write(f"[*] MOVIEBOX-LOG: Fallback Direct play fetch failed ({play_res.status_code}). Trying Fallback Proxy...\n")
+                 proxy_url = f"https://12spapi.fly.dev/proxy?url={quote_plus(play_api_url)}"
+                 play_res = session.get(proxy_url, headers=play_headers, timeout=20)
+                 
              play_res.raise_for_status()
              data = play_res.json().get('data', {})
 
@@ -787,12 +822,13 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
 
         for stream in hls_streams:
             if stream.get('url'):
-                links.append({"quality": f"{stream.get('format', 'HLS')} - {stream.get('resolutions', 'HD')}", "url": stream['url'], "needs_proxy": False})
+                links.append({"quality": f"{stream.get('format', 'HLS')} - {stream.get('resolutions', 'HD')}", "url": stream['url'], "needs_proxy": True}) # نمرر روابط الفيديو عبر البروكسي كإجراء احترازي
 
         for stream in mp4_streams:
             if stream.get('url'):
                 stream_id_for_subs = stream.get('id')
-                links.append({"quality": f"{stream.get('format', 'MP4')} - {stream.get('resolutions', 'HD')} - {format_bytes(stream.get('size')) or 'Unknown'}", "url": stream['url'], "needs_proxy": False})
+                size_str = format_bytes(stream.get('size')) or 'Unknown'
+                links.append({"quality": f"{stream.get('format', 'MP4')} - {stream.get('resolutions', 'HD')} - {size_str}", "url": stream['url'], "needs_proxy": True}) # نمرر روابط الفيديو عبر البروكسي كإجراء احترازي
 
         if not links:
             return {"status": "error", "message": "MovieBox: No valid stream URLs were extracted."}
@@ -800,19 +836,24 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
     except Exception as e:
         return {"status": "error", "message": f"MovieBox: Play API fetch failed. {e}"}
 
-    # 4. الحصول على الترجمات
+    # 4. الحصول على الترجمات عبر البروكسي إن لزم الأمر
     all_subtitles = []
     if stream_id_for_subs:
         try:
             sub_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/caption?format=MP4&id={stream_id_for_subs}&subjectId={subject_id}&detailPath={detail_path}"
             sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching subtitles...\n")
             sub_res = session.get(sub_api_url, headers=api_headers, timeout=15)
+            
+            if sub_res.status_code != 200:
+                 proxy_sub_url = f"https://12spapi.fly.dev/proxy?url={quote_plus(sub_api_url)}"
+                 sub_res = session.get(proxy_sub_url, headers=api_headers, timeout=15)
+
             if sub_res.status_code == 200:
                 for cap in sub_res.json().get('data', {}).get('captions', []):
                     if cap.get('url') and cap.get('lan'):
                         all_subtitles.append({"lang": cap['lan'], "url": cap['url']})
-        except Exception:
-            pass
+        except Exception as e:
+            sys.stderr.write(f"[!] MOVIEBOX-LOG: Failed to fetch subtitles. {e}\n")
 
     final_result = {"status": "success", "links": links}
     if all_subtitles:
@@ -840,6 +881,7 @@ female_voices = ["nova", "fable", "coral", "shimmer", "ballad"]
 
 def analyze_dialogue_with_gemini(srt_content):
     if not GEMINI_AVAILABLE:
+        sys.stderr.write("⚠️ [DUBBING-LOG] Gemini API key not configured. Cannot perform dialogue analysis.\n")
         return None
     try:
         subs = pysrt.from_string(srt_content)
@@ -891,7 +933,8 @@ Now, analyze the following dialogue:
         else:
             raise ValueError("No JSON found in Gemini response.")
 
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"❌ [DUBBING-LOG] Error during Gemini dialogue analysis: {e}\n")
         return None
 
 def tts_to_milliseconds(srt_time):
@@ -902,7 +945,8 @@ def tts_compress_mp3(file_path, bitrate="64k"):
         audio = AudioSegment.from_file(file_path)
         audio.export(file_path, format="mp3", bitrate=bitrate)
         return file_path
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"⚠️ [DUBBING-LOG] Failed to compress {file_path}: {e}\n")
         return file_path
 
 def tts_generate_line(text, voice_name, out_path, emotion="neutral", retries=5):
@@ -910,18 +954,15 @@ def tts_generate_line(text, voice_name, out_path, emotion="neutral", retries=5):
     for attempt in range(1, retries + 1):
         try:
             sys.stderr.write(f"🎙️ [{voice_name}] Generating audio... (Attempt {attempt}/{retries})\n")
-            
-            # === التعديل هنا: إرسال المتغيرات بالترتيب المباشر (Positional Arguments) ===
             audio_path, _ = tts_client.predict(
-                text,           # 1. prompt
-                voice_name,     # 2. voice
-                emotion,        # 3. emotion
-                True,           # 4. use_random_seed
-                12345,          # 5. specific_seed
-                "",             # 6. api_key_input
+                text,           
+                voice_name,     
+                emotion,        
+                True,           
+                12345,          
+                "",             
                 api_name="/text_to_speech_app"
             )
-            
             if not audio_path: raise Exception("API failed to create an audio file (returned None).")
             os.rename(audio_path, out_path)
             return tts_compress_mp3(out_path, bitrate="64k")
@@ -1028,20 +1069,31 @@ def serve_dubbed_audio(job_id, filename):
 def proxy():
     target_url = request.args.get('url')
     if not target_url: return "Missing 'url' parameter", 400
+    
+    # تحسين البروكسي لمعالجة روابط MovieBox بفعالية أكبر
+    if "moviebox" in target_url or "hakunaymatata" in target_url or "aoneroom" in target_url:
+         proxy_url = f"https://12spapi.fly.dev/proxy?url={quote_plus(target_url)}"
+         return requests.get(proxy_url, stream=True, timeout=20).content
+
     proxy_headers = {h: request.headers[h] for h in ['User-Agent', 'Accept', 'Accept-Language', 'Accept-Encoding', 'Origin', 'Referer'] if h in request.headers}
+    proxy_headers['ngrok-skip-browser-warning'] = 'true'
+    
     if 'tgtria1dbw.xyz' in target_url:
         proxy_headers['Referer'] = 'https://veloratv.ru/'
     elif 'vidmoly.net' in target_url or 'sendvid.com' in target_url:
         proxy_headers['Referer'] = 'https://ristoanime.org/'
+        
     try:
         r = requests.get(target_url, headers=proxy_headers, stream=True, timeout=20, verify=False)
         r.raise_for_status()
     except requests.exceptions.RequestException as e:
         return f"Error fetching proxied URL: {e}", 502
+        
     response_headers = {'Access-Control-Allow-Origin': '*'}
     for key, value in r.headers.items():
         if key.lower() not in ['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'access-control-allow-origin']:
             response_headers[key] = value
+            
     if 'mpegurl' in r.headers.get('content-type', ''):
         proxy_base_url = f"{request.host_url.rstrip('/')}/proxy?url="
         def generate_rewritten_playlist():
@@ -1065,7 +1117,7 @@ def subtitles_endpoint():
 @app.route('/health/tmdb', methods=['GET'])
 def check_tmdb_health():
     try:
-        response = requests.get(TMDB_BACKEND_URL, timeout=10)
+        response = requests.get("http://localhost:3000/", timeout=10)
         if response.status_code == 200: return jsonify({"status": "success", "message": "CinePro Backend is running", "response_time": response.elapsed.total_seconds()})
         else: return jsonify({"status": "warning", "message": f"CinePro Backend responded with status {response.status_code}"})
     except requests.exceptions.RequestException as e:
@@ -1111,5 +1163,36 @@ def scrape_endpoint():
     return jsonify(result), 200 if result.get('status') == 'success' else 404
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    try:
+        subprocess.run(['yt-dlp', '--version'], check=True, capture_output=True, text=True)
+        sys.stderr.write("INFO: yt-dlp check successful.\n")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        sys.stderr.write("\nFATAL: 'yt-dlp' is not found. 'aflam' and 'ristoanime' providers will fail.\n"
+                         "Please install it from: https://github.com/yt-dlp/yt-dlp\n")
+        sys.exit(1)
+    
+    port, public_url = 5000, None
+    if ngrok:
+        try:
+            ngrok.kill()
+            public_url = ngrok.connect(port).public_url
+        except Exception as e:
+             sys.stderr.write(f"\nWARN: Could not start ngrok. The API will be local only. Error: {e}\n")
+
+    print("\n" + "="*80)
+    print("🚀 Unified Media Scraper & Smart Dubbing API is Ready! 🚀")
+    print("="*80)
+    if public_url: print(f"🌍 Public HTTPS URL (Ngrok): {public_url}")
+    print(f"🏠 Local URL: http://127.0.0.1:{port}")
+    print("\n--- [ USAGE EXAMPLES ] ---")
+    base_url = public_url or f"http://127.0.0.1:{port}"
+    print(f"🎬 Movie (VeloraTV): {base_url}/scrape?provider=veloratv&type=movie&tmdb_id=872585")
+    print(f"📺 Series (Ristoanime): {base_url}/scrape?provider=ristoanime&title=attack on titan&type=series&season=4&episode=1")
+    print(f"🎬 Movie (Akwam): {base_url}/scrape?provider=akwam&title=Oppenheimer&type=movie")
+    print(f"🎬 Movie (MovieBox): {base_url}/scrape?provider=moviebox&title=Inception&type=movie")
+    print(f"📜 Subtitles (Wyzie): {base_url}/subs?type=movie&id=872585")
+    print(f"🎙️ Smart Dubbing (TTS+AI): {base_url}/dub?url=https://path/to/your/subtitle.srt")
+    print(f"🔍 Check TMDB Health: {base_url}/health/tmdb")
+    print("="*80)
+    sys.stdout.flush()
+    app.run(port=port, host='0.0.0.0', debug=False, use_reloader=False)
