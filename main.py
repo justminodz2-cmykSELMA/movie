@@ -1015,7 +1015,15 @@ def scrape_endpoint():
                 link_item['url'] = f"{api_base_url}/proxy?url={quote_plus(original_url)}"
                 del link_item["needs_proxy"]
     return jsonify(result), 200 if result.get('status') == 'success' else 404
-
+@app.route("/")
+def index():
+    return {
+        "status": "online",
+        "message": "API running"
+    }
+@app.route("/health")
+def health():
+    return "OK", 200
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
