@@ -5,7 +5,7 @@ beautifulsoup4
 playwright
 yt-dlp
 fake-useragent
-google-generativeai
+google-genai
 pysrt
 pydub
 gradio-client
