@@ -11,3 +11,4 @@ pydub
 gradio-client
 gunicorn
 urllib3
+cloudscraper
