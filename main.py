@@ -1,6 +1,5 @@
-# --- ملف: main.py (النسخة النهائية لتجاوز WAF الخاص بـ MovieBox) ---
+# --- ملف: main.py (النسخة الخفيفة والسريعة - مدمجة مع البروكسي السكني لـ MovieBox) ---
 
-# --- المكتبات الأساسية ---
 import sys
 import io
 import re
@@ -20,12 +19,11 @@ import concurrent.futures
 import uuid
 import random
 
-# --- مكتبات الـ API والبروكسي ---
 from flask import Flask, request, jsonify, Response, send_from_directory, url_for, stream_with_context
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# --- مكتبات التشغيل الآلي للمتصفح (لـ VeloraTV) ---
+# --- مكتبات التشغيل الآلي للمتصفح (لـ VeloraTV فقط) ---
 try:
     from playwright.async_api import async_playwright
 except ImportError:
@@ -314,255 +312,135 @@ def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
 # ==============================================================================
 # ========================   PROVIDER 7: MOVIEBOX (THE FIX)   ==================
 # ==============================================================================
-try:
-    import cloudscraper
-    CLOUDSCRAPER_AVAILABLE = True
-except ImportError:
-    CLOUDSCRAPER_AVAILABLE = False
-    sys.stderr.write("WARN: cloudscraper not installed. Run: pip install cloudscraper\n")
-
-MOVIEBOX_API_HOSTS = [
-    "https://h5-api.aoneroom.com",
-    "https://netfilm.world",
-]
-
-
-def _build_moviebox_session():
-    if CLOUDSCRAPER_AVAILABLE:
-        session = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-    else:
-        session = requests.Session()
-
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "sec-ch-ua": '"Chromium";v="142", "Not(A:Brand";v="24", "Google Chrome";v="142"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "x-client-info": '{"timezone":"Africa/Casablanca"}',
-    })
-
-    # Route ALL MovieBox requests through a residential proxy to bypass the
-    # 403 that datacenter IPs (Render/Northflank/etc.) get from Cloudflare.
-    # Set the env var MOVIEBOX_PROXY, e.g.:
-    #   http://user:pass@host:port  or  socks5://user:pass@host:port
+def scrape_moviebox(query, media_type, season_num, episode_num):
+    sys.stderr.write(f"[*] MOVIEBOX-LOG: Starting scrape for '{query}'...\n")
+    session = requests.Session()
+    
+    # 🌟 تفعيل البروكسي (Residential Proxy) للمرور من Cloudflare
     proxy = os.environ.get("MOVIEBOX_PROXY", "").strip()
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
-        sys.stderr.write("[MOVIEBOX] using residential proxy.\n")
+        sys.stderr.write("[*] MOVIEBOX-LOG: Using Residential Proxy.\n")
 
-    return session
+    # هيدرز المتصفح الحقيقي
+    fake_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjIwNjU1NTczNTQ1OTgyNTUwNTYsImF0cCI6MywiZXh0IjoiMTc4Mjc4NDYxNSIsImV4cCI6MTc5MDU2MDYxNSwiaWF0IjoxNzgyNzg0MzE1fQ.Och1r5a1XzVdWKHgoo87wFGRcGeBN3XY-Qa1w6dzIGk"
+    
+    session.headers.update({
+        'User-Agent': HEADERS['User-Agent'],
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.8',
+        'sec-ch-ua': '"Chromium";v="142", "Not(A:Brand";v="24", "Google Chrome";v="142"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'x-client-info': '{"timezone":"Africa/Casablanca"}',
+        'x-user': f'{{"token":"{fake_token}","userId":"2065557354598255056","userType":0,"appType":3}}',
+        'Cookie': f'token={fake_token}; mb_token="{fake_token}"'
+    })
 
-
-def _ensure_moviebox_token(session):
-    for c in session.cookies:
-        if c.name in ("mb_token", "token"):
-            return True
-
+    # 1. البحث باستخدام parse HTML
+    search_url = f"https://moviebox.ph/web/searchResult?keyword={urllib.parse.quote_plus(query)}"
     try:
-        session.get(
-            "https://netfilm.world/",
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-            },
-            timeout=15,
-        )
-    except Exception as e:
-        sys.stderr.write("[MOVIEBOX] landing page failed: %s\n" % e)
-
-    token_endpoints = [
-        "/wefeed-h5api-bff/user/info",
-        "/wefeed-h5api-bff/visitor/register",
-        "/wefeed-h5api-bff/user/visitor",
-    ]
-    api_headers = {
-        "Origin": "https://netfilm.world",
-        "Referer": "https://netfilm.world/",
-        "sec-fetch-site": "cross-site",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-dest": "empty",
-    }
-    for host in MOVIEBOX_API_HOSTS:
-        for ep in token_endpoints:
-            try:
-                r = session.get(host + ep, headers=api_headers, timeout=15)
-                token = None
-                try:
-                    body = r.json()
-                    token = (
-                        body.get("data", {}).get("token")
-                        or body.get("data", {}).get("user", {}).get("token")
-                    )
-                except Exception:
-                    pass
-                if not token:
-                    xu = r.headers.get("x-user")
-                    if xu:
-                        try:
-                            token = json.loads(xu).get("token")
-                        except Exception:
-                            pass
-                if token:
-                    session.cookies.set("mb_token", '"%s"' % token, domain="netfilm.world")
-                    session.cookies.set("mb_token", '"%s"' % token, domain="h5-api.aoneroom.com")
-                    session.headers["x-user"] = json.dumps({"token": token, "appType": 3})
-                    sys.stderr.write("[MOVIEBOX] guest token acquired.\n")
-                    return True
-                for c in session.cookies:
-                    if c.name in ("mb_token", "token"):
-                        return True
-            except Exception as e:
-                sys.stderr.write("[MOVIEBOX] token endpoint %s failed: %s\n" % (ep, e))
-                continue
-    return False
-
-
-def scrape_moviebox(query, media_type, season_num, episode_num):
-    sys.stderr.write("[*] MOVIEBOX-LOG: Starting scrape for '%s'...\n" % query)
-    session = _build_moviebox_session()
-
-    _ensure_moviebox_token(session)
-
-    api_headers = {
-        "Origin": "https://netfilm.world",
-        "Referer": "https://netfilm.world/",
-        "sec-fetch-site": "cross-site",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-dest": "empty",
-    }
-
-    search_url = "https://moviebox.ph/web/searchResult?keyword=%s" % urllib.parse.quote_plus(query)
-    try:
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching Search Page...\n")
         res = session.get(search_url, timeout=20)
-        soup = BeautifulSoup(res.text, "html.parser")
-        cards = soup.find_all("a", href=re.compile(r"^/moviedetail/"))
-        if not cards:
-            return {"status": "error", "message": "No search results found for '%s'." % query}
+        res.raise_for_status()
+        soup = BeautifulSoup(res.text, 'html.parser')
+        cards = soup.find_all('a', href=re.compile(r'^/moviedetail/'))
+        if not cards: return {"status": "error", "message": f"No search results found for '{query}'."}
 
-        results_map = {card.find("h2", class_="card-title").text.strip(): card.get("href").split("/")[-1] for card in cards if card.find("h2", class_="card-title")}
+        results_map = {card.find('h2', class_='card-title').text.strip(): card.get('href').split('/')[-1] for card in cards if card.find('h2', class_='card-title')}
         best_title, detail_path = None, None
         query_lower = query.lower().strip()
-        filtered_results = {k: v for k, v in results_map.items() if "francaise" not in k.lower()} or results_map
+        filtered_results = {k: v for k, v in results_map.items() if "française" not in k.lower()} or results_map
 
-        if media_type == "series" and season_num:
+        if media_type == 'series' and season_num:
             for t, p in filtered_results.items():
-                if t.lower().startswith("%s s%s" % (query_lower, season_num)):
-                    best_title, detail_path = t, p
-                    break
-        if not best_title and media_type == "series":
+                if t.lower().startswith(f"{query_lower} s{season_num}"): best_title, detail_path = t, p; break
+        if not best_title and media_type == 'series':
             for t, p in filtered_results.items():
-                if query_lower in t.lower() and re.search(r"s\d+-s\d+", t.lower()):
-                    best_title, detail_path = t, p
-                    break
+                if query_lower in t.lower() and re.search(r's\d+-s\d+', t.lower()): best_title, detail_path = t, p; break
         if not best_title:
             for t, p in filtered_results.items():
-                if t.lower() == query_lower:
-                    best_title, detail_path = t, p
-                    break
+                if t.lower() == query_lower: best_title, detail_path = t, p; break
         if not best_title:
             best_matches = difflib.get_close_matches(query_lower, [k.lower() for k in filtered_results.keys()], n=1, cutoff=0.6)
             if best_matches:
-                matched_lower = best_matches[0]
                 for t, p in filtered_results.items():
-                    if t.lower() == matched_lower:
-                        best_title, detail_path = t, p
-                        break
+                    if t.lower() == best_matches[0]: best_title, detail_path = t, p; break
             else:
                 for t, p in filtered_results.items():
-                    if query_lower in t.lower() or t.lower() in query_lower:
-                        best_title, detail_path = t, p
-                        break
-                if not best_title:
-                    best_title, detail_path = list(filtered_results.items())[0]
+                    if query_lower in t.lower() or t.lower() in query_lower: best_title, detail_path = t, p; break
+                if not best_title: best_title, detail_path = list(filtered_results.items())[0]
+                
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Found best match: {best_title} -> {detail_path}\n")
     except Exception as e:
-        return {"status": "error", "message": "MovieBox: Search failed. %s" % e}
+        return {"status": "error", "message": f"MovieBox: Search failed. {e}"}
 
+    # تحديث الهيدرز للـ API
+    api_headers = {
+        'Origin': 'https://netfilm.world',
+        'Referer': 'https://netfilm.world/',
+        'sec-fetch-site': 'cross-site',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty'
+    }
+
+    # 2. الحصول على subjectId
     subject_id = None
-    detail_err = None
-    for host in MOVIEBOX_API_HOSTS:
-        try:
-            detail_api_url = "%s/wefeed-h5api-bff/detail?detailPath=%s" % (host, detail_path)
-            detail_res = session.get(detail_api_url, headers=api_headers, timeout=20)
-            sys.stderr.write("[MOVIEBOX] detail %s -> %s\n" % (host, detail_res.status_code))
-            detail_res.raise_for_status()
-            # Reuse any cookies the backend hands us (critical for the play call).
-            if detail_res.cookies:
-                session.cookies.update(detail_res.cookies)
-            subject_id = detail_res.json().get("data", {}).get("subject", {}).get("subjectId")
-            if subject_id:
-                break
-        except Exception as e:
-            detail_err = e
-            sys.stderr.write("[MOVIEBOX] detail %s failed: %s\n" % (host, e))
-            continue
-    if not subject_id:
-        return {"status": "error", "message": "MovieBox: Failed to get subjectId. %s" % detail_err}
+    try:
+        detail_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/detail?detailPath={detail_path}"
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching SubjectID...\n")
+        detail_res = session.get(detail_api_url, headers=api_headers, timeout=20)
+        detail_res.raise_for_status()
+        subject_id = detail_res.json().get('data', {}).get('subject', {}).get('subjectId')
+        if not subject_id: return {"status": "error", "message": "MovieBox: Failed to get subjectId."}
+    except Exception as e:
+        return {"status": "error", "message": f"MovieBox: Detail fetch failed. {e}"}
 
+    # 3. الحصول على روابط البث (Play)
     links, stream_id_for_subs = [], None
-    se = season_num if media_type == "series" and season_num else 0
-    ep = episode_num if media_type == "series" and episode_num else 0
-    play_headers = api_headers.copy()
-    play_headers["Referer"] = "https://netfilm.world/spa/videoPlayPage/movies/%s?id=%s&detailSe=&detailEp=&lang=en&type=/movie/detail" % (detail_path, subject_id)
+    try:
+        se = season_num if media_type == 'series' and season_num else 0
+        ep = episode_num if media_type == 'series' and episode_num else 0
+        
+        play_headers = api_headers.copy()
+        play_headers['Referer'] = f'https://netfilm.world/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&detailSe=&detailEp=&lang=en&type=/movie/detail'
 
-    data = None
-    play_err = None
-    for host in MOVIEBOX_API_HOSTS:
-        try:
-            play_api_url = "%s/wefeed-h5api-bff/subject/play?subjectId=%s&se=%s&ep=%s&detailPath=%s" % (host, subject_id, se, ep, detail_path)
-            play_res = session.get(play_api_url, headers=play_headers, timeout=20)
-            sys.stderr.write("[MOVIEBOX] play %s -> %s\n" % (host, play_res.status_code))
-            play_res.raise_for_status()
-            data = play_res.json().get("data", {})
+        play_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+        sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching Play Stream...\n")
+        play_res = session.get(play_api_url, headers=play_headers, timeout=20)
+        play_res.raise_for_status()
+        data = play_res.json().get('data', {})
+        
+        if (not data or not data.get('hasResource')) and media_type == 'series':
+             play_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se=0&ep={ep}&detailPath={detail_path}"
+             play_res = session.get(play_api_url, headers=play_headers, timeout=20)
+             data = play_res.json().get('data', {})
 
-            if (not data or not data.get("hasResource")) and media_type == "series":
-                play_api_url = "%s/wefeed-h5api-bff/subject/play?subjectId=%s&se=0&ep=%s&detailPath=%s" % (host, subject_id, ep, detail_path)
-                play_res = session.get(play_api_url, headers=play_headers, timeout=20)
-                data = play_res.json().get("data", {})
+        if not data or not data.get('hasResource'): return {"status": "error", "message": "MovieBox: No streams available."}
 
-            if data and data.get("hasResource"):
-                break
-        except Exception as e:
-            play_err = e
-            continue
+        for stream in data.get('dash', []) or data.get('hls', []):
+            if stream.get('url'): links.append({"quality": f"{stream.get('format', 'HLS')} - {stream.get('resolutions', 'HD')}", "url": stream['url'], "needs_proxy": True})
+        for stream in data.get('streams', []):
+            if stream.get('url'):
+                stream_id_for_subs = stream.get('id')
+                links.append({"quality": f"{stream.get('format', 'MP4')} - {stream.get('resolutions', 'HD')} - {format_bytes(stream.get('size')) or 'Unknown'}", "url": stream['url'], "needs_proxy": True})
+        if not links: return {"status": "error", "message": "MovieBox: No valid stream URLs were extracted."}
+    except Exception as e:
+        return {"status": "error", "message": f"MovieBox: Play API fetch failed. {e}"}
 
-    if not data or not data.get("hasResource"):
-        msg = "MovieBox: No streams available." if not play_err else "MovieBox: Play API fetch failed. %s" % play_err
-        return {"status": "error", "message": msg}
-
-    for stream in data.get("dash", []) or data.get("hls", []):
-        if stream.get("url"):
-            links.append({"quality": "%s - %s" % (stream.get("format", "HLS"), stream.get("resolutions", "HD")), "url": stream["url"], "needs_proxy": True})
-    for stream in data.get("streams", []):
-        if stream.get("url"):
-            stream_id_for_subs = stream.get("id")
-            links.append({"quality": "%s - %s - %s" % (stream.get("format", "MP4"), stream.get("resolutions", "HD"), format_bytes(stream.get("size")) or "Unknown"), "url": stream["url"], "needs_proxy": True})
-    if not links:
-        return {"status": "error", "message": "MovieBox: No valid stream URLs were extracted."}
-
+    # 4. الحصول على الترجمات
     all_subtitles = []
     if stream_id_for_subs:
-        for host in MOVIEBOX_API_HOSTS:
-            try:
-                sub_api_url = "%s/wefeed-h5api-bff/subject/caption?format=MP4&id=%s&subjectId=%s&detailPath=%s" % (host, stream_id_for_subs, subject_id, detail_path)
-                sub_res = session.get(sub_api_url, headers=api_headers, timeout=15)
-                if sub_res.status_code == 200:
-                    for cap in sub_res.json().get("data", {}).get("captions", []):
-                        if cap.get("url") and cap.get("lan"):
-                            all_subtitles.append({"lang": cap["lan"], "url": cap["url"]})
-                    if all_subtitles:
-                        break
-            except Exception:
-                continue
+        try:
+            sub_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/caption?format=MP4&id={stream_id_for_subs}&subjectId={subject_id}&detailPath={detail_path}"
+            sub_res = session.get(sub_api_url, headers=api_headers, timeout=15)
+            if sub_res.status_code == 200:
+                for cap in sub_res.json().get('data', {}).get('captions', []):
+                    if cap.get('url') and cap.get('lan'): all_subtitles.append({"lang": cap['lan'], "url": cap['url']})
+        except Exception: pass
 
     final_result = {"status": "success", "links": links}
-    if all_subtitles:
-        final_result["subtitles"] = all_subtitles
+    if all_subtitles: final_result["subtitles"] = all_subtitles
     return final_result
 
 # ==============================================================================
