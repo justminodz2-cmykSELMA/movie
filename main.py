@@ -1,4 +1,4 @@
-# --- ملف: main.py (النسخة النهائية والمبسطة لتشغيل MovieBox مع البروكسي السكني) ---
+# --- ملف: main.py (النسخة النهائية والمبسطة لتشغيل MovieBox مع البروكسي السكني بدون تغليف روابط البث) ---
 
 import sys
 import io
@@ -430,12 +430,14 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
 
         if not data or not data.get("hasResource"): return {"status": "error", "message": "MovieBox: No streams available."}
 
+        # 🚀 التعديل هنا: needs_proxy أصبحت False حتى لا يتم تغليفها بـ /proxy
         for stream in data.get("dash", []) or data.get("hls", []):
-            if stream.get("url"): links.append({"quality": f"{stream.get('format', 'HLS')} - {stream.get('resolutions', 'HD')}", "url": stream["url"], "needs_proxy": True})
+            if stream.get("url"): links.append({"quality": f"{stream.get('format', 'HLS')} - {stream.get('resolutions', 'HD')}", "url": stream["url"], "needs_proxy": False})
         for stream in data.get("streams", []):
             if stream.get("url"):
                 stream_id_for_subs = stream.get("id")
-                links.append({"quality": f"{stream.get('format', 'MP4')} - {stream.get('resolutions', 'HD')} - {format_bytes(stream.get('size')) or 'Unknown'}", "url": stream["url"], "needs_proxy": True})
+                links.append({"quality": f"{stream.get('format', 'MP4')} - {stream.get('resolutions', 'HD')} - {format_bytes(stream.get('size')) or 'Unknown'}", "url": stream["url"], "needs_proxy": False})
+        
         if not links: return {"status": "error", "message": "MovieBox: No valid stream URLs were extracted."}
     except Exception as e:
         return {"status": "error", "message": f"MovieBox: Play API fetch failed. {e}"}
