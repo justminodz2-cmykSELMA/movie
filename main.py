@@ -1,4 +1,4 @@
-# --- ملف: main.py (النسخة النهائية للاستضافة السحابية - تخطي حماية MovieBox بالمتصفح) ---
+# --- ملف: main.py (النسخة النهائية لتجاوز WAF الخاص بـ MovieBox) ---
 
 # --- المكتبات الأساسية ---
 import sys
@@ -18,18 +18,17 @@ import os
 import time
 import concurrent.futures
 import uuid
+import random
 
 # --- مكتبات الـ API والبروكسي ---
 from flask import Flask, request, jsonify, Response, send_from_directory, url_for, stream_with_context
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# --- مكتبات التشغيل الآلي للمتصفح ---
+# --- مكتبات التشغيل الآلي للمتصفح (لـ VeloraTV) ---
 try:
-    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+    from playwright.async_api import async_playwright
 except ImportError:
-    sys.stderr.write("WARN: Playwright not installed. Some providers will not work.\n")
-    class PlaywrightTimeoutError(Exception): pass
     async_playwright = None
 
 # --- مكتبة الذكاء الاصطناعي ---
@@ -81,13 +80,11 @@ def format_bytes(size_bytes):
         size_name = ("B", "KB", "MB", "GB", "TB")
         i = int(math.floor(math.log(size_bytes, 1024)))
         p = math.pow(1024, i)
-        s = round(size_bytes / p, 2)
-        return f"{s} {size_name[i]}"
-    except (ValueError, TypeError):
-        return None
+        return f"{round(size_bytes / p, 2)} {size_name[i]}"
+    except: return None
 
 # ==============================================================================
-# ========================   PROVIDER: AKWAM   ===============================
+# ========================   PROVIDER 1: AKWAM   ===============================
 # ==============================================================================
 def akwam_make_request(url):
     try:
@@ -124,27 +121,24 @@ def akwam_get_video_links_from_player(content_page_url):
     for tab in soup.find_all('div', class_='tab-content quality'):
         watch_link_tag = tab.find('a', class_='link-show')
         if watch_link_tag and 'href' in watch_link_tag.attrs:
-            watch_id = watch_link_tag['href'].split('/')[-1]
             try:
                 url_parts = content_page_url.split('/')
-                watch_page_urls.append(f"https://ak.sv/watch/{watch_id}/{url_parts[-2]}/{url_parts[-1]}")
+                watch_page_urls.append(f"https://ak.sv/watch/{watch_link_tag['href'].split('/')[-1]}/{url_parts[-2]}/{url_parts[-1]}")
             except IndexError: continue
     for url in set(watch_page_urls):
         player_soup = akwam_make_request(url)
         if not player_soup: continue
-        video_tag = player_soup.find('video', id='player')
-        if video_tag:
+        if video_tag := player_soup.find('video', id='player'):
             for source in video_tag.find_all('source'):
                 if source.get('src'): final_video_links.add((source.get('size', 'N/A'), source['src']))
-    return [{"quality": quality, "url": link, "needs_proxy": False} for quality, link in sorted(list(final_video_links), key=lambda x: int(x[0]) if x[0].isdigit() else 0, reverse=True)]
+    return [{"quality": q, "url": l, "needs_proxy": False} for q, l in sorted(list(final_video_links), key=lambda x: int(x[0]) if x[0].isdigit() else 0, reverse=True)]
 
 def akwam_find_episode_on_season_page(season_url, episode_number):
     season_soup = akwam_make_request(season_url)
     if not season_soup: return None
     episode_pattern = re.compile(r'(?:الحلقة|حلقة)\s*(\d{1,3})', re.IGNORECASE)
     for container in season_soup.find_all('div', class_='bg-primary2'):
-        title_tag = container.find('h2').find('a') if container.find('h2') else None
-        if title_tag and title_tag.get('href'):
+        if (title_tag := container.find('a')) and title_tag.get('href'):
             match = episode_pattern.search(' '.join(title_tag.text.strip().split()))
             if match and int(match.group(1)) == episode_number: return title_tag['href']
     return None
@@ -159,7 +153,7 @@ def scrape_akwam(query, media_type, season_num, episode_num):
         all_search_results.extend(results_on_page)
         if search_soup.find('nav', attrs={'aria-label': 'Page navigation'}) and search_soup.find('nav').find('a', class_='page-link', string=re.compile(r'التالي')): current_page += 1
         else: break
-    if not all_search_results: return {"status": "error", "message": "No results found on Akwam."}
+    if not all_search_results: return {"status": "error", "message": "No search results."}
     selected = select_best_match_with_gemini(query, media_type, season_num, all_search_results)
     if media_type == 'movie':
         links = akwam_get_video_links_from_player(selected['url'])
@@ -171,36 +165,28 @@ def scrape_akwam(query, media_type, season_num, episode_num):
         return {"status": "success", "links": links} if links else {"status": "error", "message": "No links found."}
 
 # ==============================================================================
-# ========================   PROVIDER: VELORATV   ============================
+# ========================   PROVIDER 2: VELORATV   ============================
 # ==============================================================================
-async def velora_extract_links_from_url(url: str, context):
-    VELORA_M3U8_PATTERN = re.compile(r"https://[^\s\"']+.m3u8[^\s\"']")
-    VELORA_SUBTITLE_PATTERN = re.compile(r"https://[^\s\"']+format=srt[^\s\"']")
-    m3u8_links, subtitle_links = set(), set()
-    page = await context.new_page()
-    def handle_request(req):
-        if VELORA_M3U8_PATTERN.search(req.url): m3u8_links.add(req.url)
-        if VELORA_SUBTITLE_PATTERN.search(req.url): subtitle_links.add(req.url)
-    page.on("request", handle_request)
-    try:
-        await page.goto(url, timeout=60000, wait_until='domcontentloaded')
-        await page.wait_for_selector("div.player-servers, iframe", timeout=15000)
-        for server in ["Alpha", "Bravo", "Charlie"]:
-            try:
-                await page.get_by_text(server, exact=True).click(timeout=5000)
-                await page.wait_for_timeout(3000)
-                if m3u8_links: break
-            except Exception: pass
-    except Exception: pass
-    finally: await page.close()
-    return m3u8_links, subtitle_links
-
 async def velora_async_main(watch_url):
     if not async_playwright: return set(), set()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent=HEADERS['User-Agent'])
-        return await velora_extract_links_from_url(watch_url, context)
+        page = await context.new_page()
+        m3u8_links, subtitle_links = set(), set()
+        page.on("request", lambda req: (m3u8_links.add(req.url) if ".m3u8" in req.url else None, subtitle_links.add(req.url) if "format=srt" in req.url else None))
+        try:
+            await page.goto(watch_url, timeout=60000, wait_until='domcontentloaded')
+            await page.wait_for_selector("div.player-servers, iframe", timeout=15000)
+            for server in ["Alpha", "Bravo", "Charlie"]:
+                try:
+                    await page.get_by_text(server, exact=True).click(timeout=5000)
+                    await page.wait_for_timeout(3000)
+                    if m3u8_links: break
+                except Exception: pass
+        except Exception: pass
+        finally: await page.close()
+        return m3u8_links, subtitle_links
 
 def scrape_veloratv(media_type, season, episode, tmdb_id):
     watch_url = f"https://veloratv.ru/watch/{'movie' if media_type == 'movie' else f'tv/{tmdb_id}/{season}/{episode}'}/{tmdb_id}"
@@ -213,20 +199,19 @@ def scrape_veloratv(media_type, season, episode, tmdb_id):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# ========================   PROVIDER: AFLAM   ===============================
+# ========================   PROVIDER 3: AFLAM   ===============================
 # ==============================================================================
 def scrape_aflam(query, media_type, episode_num):
     session = requests.Session()
     session.headers.update(HEADERS)
-    search_url = f"https://afllam.onl/?s={urllib.parse.quote(query)}"
     try:
-        response = session.get(search_url, timeout=20)
+        response = session.get(f"https://afllam.onl/?s={urllib.parse.quote(query)}", timeout=20)
         soup = BeautifulSoup(response.text, 'html.parser')
         entries = soup.select('div.widget-body .entry-box-1')
         if not entries: return {"status": "error", "message": "No search results."}
         results_map = {entry.select_one('h3.entry-title a').text.strip(): entry.select_one('h3.entry-title a')['href'] for entry in entries if entry.select_one('h3.entry-title a')}
         best_matches = difflib.get_close_matches(query, list(results_map.keys()), n=1, cutoff=0.5)
-        if not best_matches: return {"status": "error", "message": "No close match."}
+        if not best_matches: return {"status": "error", "message": "No match."}
         page_url = results_map[best_matches[0]]
         
         soup = BeautifulSoup(session.get(page_url, timeout=20).text, 'html.parser')
@@ -249,7 +234,7 @@ def scrape_aflam(query, media_type, episode_num):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# ========================   PROVIDER: RISTOANIME   ==========================
+# ========================   PROVIDER 4: RISTOANIME   ==========================
 # ==============================================================================
 def scrape_ristoanime(query, season_num, episode_num):
     session = requests.Session()
@@ -281,7 +266,7 @@ def scrape_ristoanime(query, season_num, episode_num):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# ====================   PROVIDER: ARABIC-TOONS   ============================
+# ====================   PROVIDER 5: ARABIC-TOONS   ============================
 # ==============================================================================
 def scrape_arabic_toons(query, season_num, episode_num):
     session = requests.Session()
@@ -311,7 +296,7 @@ def scrape_arabic_toons(query, season_num, episode_num):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# ========================   PROVIDER: TMDB   ================================
+# ========================   PROVIDER 6: TMDB   ================================
 # ==============================================================================
 def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
     endpoint = f"{TMDB_BACKEND_URL}/movie/{tmdb_id}" if media_type == 'movie' else f"{TMDB_BACKEND_URL}/tv/{tmdb_id}?s={season}&e={episode}"
@@ -327,110 +312,36 @@ def scrape_tmdb(media_type, tmdb_id, season=None, episode=None):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# ========================   PROVIDER: MOVIEBOX (PLAYWRIGHT FIX)   =============
+# ========================   PROVIDER 7: MOVIEBOX (THE FIX)   ==================
 # ==============================================================================
-# 🌟 التحديث الذهبي: نستخدم Playwright للتعامل مع API الخاص بـ MovieBox لتجاوز حظر 403 Forbidden
-async def fetch_moviebox_data_via_browser(detail_path, season_num, episode_num, media_type):
-    if not async_playwright:
-        raise Exception("Playwright is required to bypass MovieBox WAF protection.")
-    
-    async with async_playwright() as p:
-        # إطلاق المتصفح
-        browser = await p.chromium.launch(headless=True)
-        # تحديد الهيدرز لتطابق المتصفح الحقيقي
-        context = await browser.new_context(
-            user_agent=HEADERS['User-Agent'],
-            extra_http_headers={
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Origin': 'https://netfilm.world',
-                'Referer': 'https://netfilm.world/'
-            }
-        )
-        page = await context.new_page()
-
-        # 1. الدخول للصفحة الرئيسية لـ MovieBox لتخطي حماية Cloudflare WAF وأخذ الكوكيز الحقيقية
-        sys.stderr.write("[*] MOVIEBOX-LOG: Bypassing WAF via Playwright...\n")
-        try:
-            await page.goto("https://netfilm.world/", timeout=15000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000) # انتظار قليل للسماح للجافاسكريبت بالعمل
-        except Exception:
-            pass # نتجاهل التايم أوت ونكمل
-
-        # 2. جلب الـ Subject ID باستخدام دالة داخلية في المتصفح (لتفادي أي حظر على مستوى Python)
-        sys.stderr.write("[*] MOVIEBOX-LOG: Fetching details API internally...\n")
-        detail_api = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/detail?detailPath={detail_path}"
-        
-        # التوكنز الوهمية
-        fake_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjc2OTU3MzE5ODU3Mjk2MDg1MjAsImF0cCI6MywiZXh0IjoiMTc3ODc3NDc1MiIsImV4cCI6MTc4NjU1MDc1MiwiaWF0IjoxNzc4Nzc0NDUyfQ.DNO0J8lH7m650oAsiiib9dVUrFcceOqICkt_OIxACNE"
-        
-        js_fetch_detail = f"""
-        async () => {{
-            const res = await fetch("{detail_api}", {{
-                headers: {{
-                    "x-client-info": '{{"timezone":"Africa/Casablanca"}}',
-                    "x-user": '{{"token":"{fake_token}","userId":"7695731985729608520","userType":0,"appType":3}}'
-                }}
-            }});
-            return await res.json();
-        }}
-        """
-        detail_data = await page.evaluate(js_fetch_detail)
-        subject_id = detail_data.get('data', {}).get('subject', {}).get('subjectId')
-
-        if not subject_id:
-            await browser.close()
-            raise Exception("Failed to get Subject ID from MovieBox inside browser.")
-
-        # 3. جلب روابط الفيديو (Play API)
-        sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching Play API for Subject {subject_id}...\n")
-        se = season_num if media_type == 'series' and season_num else 0
-        ep = episode_num if media_type == 'series' and episode_num else 0
-        
-        play_api = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
-        
-        js_fetch_play = f"""
-        async () => {{
-            const res = await fetch("{play_api}", {{
-                headers: {{
-                    "x-client-info": '{{"timezone":"Africa/Casablanca"}}',
-                    "x-user": '{{"token":"{fake_token}","userId":"7695731985729608520","userType":0,"appType":3}}'
-                }}
-            }});
-            return await res.json();
-        }}
-        """
-        play_data = await page.evaluate(js_fetch_play)
-        
-        # إذا كان مسلسل ولم يجد الحلقة، نجرب se=0
-        if (not play_data.get('data') or not play_data['data'].get('hasResource')) and media_type == 'series':
-            play_api_fallback = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se=0&ep={ep}&detailPath={detail_path}"
-            play_data = await page.evaluate(js_fetch_play.replace(play_api, play_api_fallback))
-
-        # 4. جلب الترجمات إن وجدت
-        subs_data = None
-        streams = play_data.get('data', {}).get('streams', [])
-        if streams and len(streams) > 0 and streams[0].get('id'):
-            stream_id = streams[0]['id']
-            subs_api = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/caption?format=MP4&id={stream_id}&subjectId={subject_id}&detailPath={detail_path}"
-            try:
-                subs_data = await page.evaluate(js_fetch_play.replace(play_api, subs_api))
-            except Exception: pass
-
-        await browser.close()
-        return play_data.get('data', {}), subs_data
-
 def scrape_moviebox(query, media_type, season_num, episode_num):
-    sys.stderr.write(f"[*] MOVIEBOX-LOG: Starting search for '{query}'...\n")
-    # 1. البحث باستخدام requests العادي لأنه صفحة HTML ولا يوجد عليها حظر API شديد
+    sys.stderr.write(f"[*] MOVIEBOX-LOG: Starting scrape for '{query}'...\n")
     session = requests.Session()
-    search_url = f"https://moviebox.ph/web/searchResult?keyword={urllib.parse.quote_plus(query)}"
-    headers = {'User-Agent': HEADERS['User-Agent'], 'Accept-Language': 'en-US,en;q=0.5'}
+    
+    # محاكاة هيدرز متصفح حقيقي بالملي (Bypass WAF)
+    base_headers = {
+        'User-Agent': HEADERS['User-Agent'],
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'sec-ch-ua': '"Chromium";v="142", "Not(A:Brand";v="24", "Google Chrome";v="142"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'x-client-info': '{"timezone":"Africa/Casablanca"}'
+    }
+    session.headers.update(base_headers)
+
+    # 1. زيارة الصفحة الرئيسية لأخذ ملفات الكوكيز الأولية
     try:
-        res = session.get(search_url, headers=headers, timeout=15)
-        res.raise_for_status()
+        session.get('https://netfilm.world/', headers={'Accept': 'text/html', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-site': 'none'}, timeout=10)
+    except Exception: pass
+
+    # 2. البحث
+    search_url = f"https://moviebox.ph/web/searchResult?keyword={urllib.parse.quote_plus(query)}"
+    try:
+        res = session.get(search_url, timeout=15)
         soup = BeautifulSoup(res.text, 'html.parser')
         cards = soup.find_all('a', href=re.compile(r'^/moviedetail/'))
-        if not cards: return {"status": "error", "message": f"No search results for '{query}'."}
+        if not cards: return {"status": "error", "message": f"No search results found for '{query}'."}
 
         results_map = {card.find('h2', class_='card-title').text.strip(): card.get('href').split('/')[-1] for card in cards if card.find('h2', class_='card-title')}
         best_title, detail_path = None, None
@@ -449,42 +360,83 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         if not best_title:
             best_matches = difflib.get_close_matches(query_lower, [k.lower() for k in filtered_results.keys()], n=1, cutoff=0.6)
             if best_matches:
+                matched_lower = best_matches[0]
                 for t, p in filtered_results.items():
-                    if t.lower() == best_matches[0]: best_title, detail_path = t, p; break
+                    if t.lower() == matched_lower: best_title, detail_path = t, p; break
             else:
-                best_title, detail_path = list(filtered_results.items())[0]
+                for t, p in filtered_results.items():
+                    if query_lower in t.lower() or t.lower() in query_lower: best_title, detail_path = t, p; break
+                if not best_title: best_title, detail_path = list(filtered_results.items())[0]
     except Exception as e:
-        return {"status": "error", "message": f"Search failed: {e}"}
+        return {"status": "error", "message": f"MovieBox: Search failed. {e}"}
 
-    sys.stderr.write(f"[*] MOVIEBOX-LOG: Found Path '{detail_path}'. Handing over to Playwright...\n")
+    # 🌟 التغيير السحري هنا: توجيه كل طلبات API إلى النطاق الخلفي (h5-api.aoneroom.com) لتخطي حظر Cloudflare!
+    api_headers = {
+        'Origin': 'https://netfilm.world',
+        'Referer': 'https://netfilm.world/',
+        'sec-fetch-site': 'cross-site',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty'
+    }
     
-    # 2. تشغيل Playwright لتخطي 403 وجلب الـ JSON
+    subject_id = None
     try:
-        play_data, subs_data = asyncio.run(fetch_moviebox_data_via_browser(detail_path, season_num, episode_num, media_type))
+        detail_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/detail?detailPath={detail_path}"
+        detail_res = session.get(detail_api_url, headers=api_headers, timeout=15)
+        detail_res.raise_for_status()
+        subject_id = detail_res.json().get('data', {}).get('subject', {}).get('subjectId')
+        if not subject_id: return {"status": "error", "message": "MovieBox: Failed to get subjectId."}
     except Exception as e:
-        return {"status": "error", "message": f"MovieBox API blocked or failed: {str(e)}"}
+        return {"status": "error", "message": f"MovieBox: Detail fetch failed. {e}"}
 
-    if not play_data or not play_data.get('hasResource'):
-        return {"status": "error", "message": "MovieBox: No streams available."}
+    links, stream_id_for_subs = [], None
+    try:
+        se = season_num if media_type == 'series' and season_num else 0
+        ep = episode_num if media_type == 'series' and episode_num else 0
+        
+        # استخدام h5-api لطلب الـ play أيضاً!
+        play_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+        
+        play_headers = api_headers.copy()
+        play_headers['Referer'] = f'https://netfilm.world/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&detailSe=&detailEp=&lang=en&type=/movie/detail'
 
-    links = []
-    # 🌟 كل السيرفرات تحتاج إلى البروكسي الداخلي (needs_proxy = True)
-    for stream in play_data.get('dash', []) or play_data.get('hls', []):
-        if stream.get('url'): links.append({"quality": f"{stream.get('format', 'HLS')} - {stream.get('resolutions', 'HD')}", "url": stream['url'], "needs_proxy": True})
-    for stream in play_data.get('streams', []):
-        if stream.get('url'): links.append({"quality": f"{stream.get('format', 'MP4')} - {stream.get('resolutions', 'HD')} - {format_bytes(stream.get('size')) or 'Unknown'}", "url": stream['url'], "needs_proxy": True})
+        play_res = session.get(play_api_url, headers=play_headers, timeout=15)
+        play_res.raise_for_status()
+        data = play_res.json().get('data', {})
+        
+        if (not data or not data.get('hasResource')) and media_type == 'series':
+             play_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se=0&ep={ep}&detailPath={detail_path}"
+             play_res = session.get(play_api_url, headers=play_headers, timeout=15)
+             data = play_res.json().get('data', {})
+
+        if not data or not data.get('hasResource'): return {"status": "error", "message": "MovieBox: No streams available."}
+
+        for stream in data.get('dash', []) or data.get('hls', []):
+            if stream.get('url'): links.append({"quality": f"{stream.get('format', 'HLS')} - {stream.get('resolutions', 'HD')}", "url": stream['url'], "needs_proxy": True})
+        for stream in data.get('streams', []):
+            if stream.get('url'):
+                stream_id_for_subs = stream.get('id')
+                links.append({"quality": f"{stream.get('format', 'MP4')} - {stream.get('resolutions', 'HD')} - {format_bytes(stream.get('size')) or 'Unknown'}", "url": stream['url'], "needs_proxy": True})
+        if not links: return {"status": "error", "message": "MovieBox: No valid stream URLs were extracted."}
+    except Exception as e:
+        return {"status": "error", "message": f"MovieBox: Play API fetch failed. {e}"}
 
     all_subtitles = []
-    if subs_data and subs_data.get('data', {}).get('captions'):
-        for cap in subs_data['data']['captions']:
-            if cap.get('url') and cap.get('lan'): all_subtitles.append({"lang": cap['lan'], "url": cap['url']})
+    if stream_id_for_subs:
+        try:
+            sub_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/caption?format=MP4&id={stream_id_for_subs}&subjectId={subject_id}&detailPath={detail_path}"
+            sub_res = session.get(sub_api_url, headers=api_headers, timeout=15)
+            if sub_res.status_code == 200:
+                for cap in sub_res.json().get('data', {}).get('captions', []):
+                    if cap.get('url') and cap.get('lan'): all_subtitles.append({"lang": cap['lan'], "url": cap['url']})
+        except Exception: pass
 
     final_result = {"status": "success", "links": links}
     if all_subtitles: final_result["subtitles"] = all_subtitles
     return final_result
 
 # ==============================================================================
-# ========================   PROVIDER: SUBTITLES   ===========================
+# ========================   PROVIDER 8: SUBTITLES   ===========================
 # ==============================================================================
 def get_subtitles_from_wyzie(content_type, tmdb_id, season=None, episode=None):
     url = f"https://sub.wyzie.ru/search?id={tmdb_id}&format=srt" if content_type == "movie" else f"https://sub.wyzie.ru/search?id={tmdb_id}&season={season}&episode={episode}&format=srt"
@@ -494,7 +446,7 @@ def get_subtitles_from_wyzie(content_type, tmdb_id, season=None, episode=None):
     except Exception as e: return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# =====================   PROVIDER: DUBBING (TTS)   ==========================
+# =====================   PROVIDER 9: DUBBING (TTS)   ==========================
 # ==============================================================================
 OUTPUT_DIR = "output_audio"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -543,7 +495,6 @@ def dub_srt_endpoint():
 def serve_dubbed_audio(job_id, filename):
     return send_from_directory(os.path.join(OUTPUT_DIR, job_id), filename)
 
-# 🌟 البروكسي الداخلي السريع
 @app.route('/proxy', methods=["GET", "HEAD", "OPTIONS"])
 def proxy():
     if request.method == "OPTIONS":
@@ -556,7 +507,7 @@ def proxy():
     proxy_headers = {h: request.headers[h] for h in ['User-Agent', 'Accept'] if h in request.headers}
     proxy_headers["Accept-Encoding"] = "identity"
     
-    # 🌟 تخطي حماية MovieBox للروابط M3U8 و MP4
+    # تجاوز حماية MovieBox / hakunaymatata للبروكسي
     if any(x in target_url for x in ['hakunaymatata.com', 'bcdnxw', 'valiw.']):
         proxy_headers.update({'Referer': 'https://fmoviesunblocked.net/', 'Origin': 'https://fmoviesunblocked.net'})
     elif 'tgtria1dbw.xyz' in target_url: proxy_headers['Referer'] = 'https://veloratv.ru/'
@@ -581,6 +532,22 @@ def proxy():
                 if chunk: yield chunk
         return Response(stream_with_context(mp4_stream()), headers=resp_headers, status=r.status_code)
     except Exception as e: return str(e), 502
+
+@app.route("/subs", methods=["GET"])
+def subtitles_endpoint():
+    content_type, tmdb_id = request.args.get("type"), request.args.get("id")
+    if not content_type or not tmdb_id: return jsonify({"status": "error", "message": "يجب إدخال type و id"}), 400
+    result = get_subtitles_from_wyzie(content_type, tmdb_id, request.args.get("season"), request.args.get("episode"))
+    return jsonify(result), 200 if result.get('status') == 'success' else 404
+
+@app.route('/health/tmdb', methods=['GET'])
+def check_tmdb_health():
+    try:
+        response = requests.get(TMDB_BACKEND_URL, timeout=10)
+        if response.status_code == 200: return jsonify({"status": "success", "message": "CinePro Backend is running"})
+        else: return jsonify({"status": "warning"})
+    except requests.exceptions.RequestException as e:
+        return jsonify({"status": "error"}), 503
 
 @app.route('/scrape', methods=['GET'])
 def scrape_endpoint():
