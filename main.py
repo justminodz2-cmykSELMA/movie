@@ -322,6 +322,14 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         session.proxies.update({"http": proxy, "https": proxy})
         sys.stderr.write("[*] MOVIEBOX-LOG: Using Residential Proxy.\n")
 
+    # Proxy for region-restricted API calls (detail/play/caption).
+    # Set MOVIEBOX_REGION_PROXY to a proxy located in an ALLOWED region
+    # (e.g. Morocco / Algeria / Middle East). Falls back to the main proxy.
+    region_proxy = os.environ.get("MOVIEBOX_REGION_PROXY", "").strip() or proxy
+    region_proxies = {"http": region_proxy, "https": region_proxy} if region_proxy else None
+    if region_proxies:
+        sys.stderr.write("[*] MOVIEBOX-LOG: Region proxy configured for play/detail API.\n")
+
     # 🌟 التوكن الذي أرسلته أنت والذي ثبت نجاحه
     fake_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjIwNjU1NTczNTQ1OTgyNTUwNTYsImF0cCI6MywiZXh0IjoiMTc4Mjc4NDYxNSIsImV4cCI6MTc5MDU2MDYxNSwiaWF0IjoxNzgyNzg0MzE1fQ.Och1r5a1XzVdWKHgoo87wFGRcGeBN3XY-Qa1w6dzIGk"
     
@@ -384,8 +392,9 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
     subject_id = None
     try:
         sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching Details...\n")
-        detail_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/detail?detailPath={detail_path}"
-        detail_res = session.get(detail_api_url, timeout=20)
+        detail_api_url = f"https://netfilm.world/wefeed-h5api-bff/detail?detailPath={detail_path}"
+        session.headers.update({"Referer": "https://netfilm.world/", "Origin": "https://netfilm.world"})
+        detail_res = session.get(detail_api_url, timeout=20, proxies=region_proxies)
         detail_res.raise_for_status()
         subject_id = detail_res.json().get("data", {}).get("subject", {}).get("subjectId")
         if not subject_id: return {"status": "error", "message": "MovieBox: Failed to get subjectId."}
@@ -399,18 +408,24 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         ep = episode_num if media_type == "series" and episode_num else 0
         
         sys.stderr.write(f"[*] MOVIEBOX-LOG: Fetching Play URL...\n")
-        play_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+        play_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
         
         # إضافة Referer مخصص للـ Play API كما يطلبه السيرفر
         session.headers.update({"Referer": f"https://netfilm.world/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&detailSe=&detailEp=&lang=en&type=/movie/detail"})
         
-        play_res = session.get(play_api_url, timeout=20)
+        play_res = session.get(play_api_url, timeout=20, proxies=region_proxies)
+
+        print("STATUS:", play_res.status_code)
+        print("URL:", play_api_url)
+        print("BODY:", play_res.text[:1000])
+
+        play_res.raise_for_status()
         play_res.raise_for_status()
         data = play_res.json().get("data", {})
 
         if (not data or not data.get("hasResource")) and media_type == "series":
-             play_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se=0&ep={ep}&detailPath={detail_path}"
-             play_res = session.get(play_api_url, timeout=20)
+             play_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se=0&ep={ep}&detailPath={detail_path}"
+             play_res = session.get(play_api_url, timeout=20, proxies=region_proxies)
              data = play_res.json().get("data", {})
 
         if not data or not data.get("hasResource"): return {"status": "error", "message": "MovieBox: No streams available."}
@@ -429,8 +444,8 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
     all_subtitles = []
     if stream_id_for_subs:
         try:
-            sub_api_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/caption?format=MP4&id={stream_id_for_subs}&subjectId={subject_id}&detailPath={detail_path}"
-            sub_res = session.get(sub_api_url, timeout=15)
+            sub_api_url = f"https://netfilm.world/wefeed-h5api-bff/subject/caption?format=MP4&id={stream_id_for_subs}&subjectId={subject_id}&detailPath={detail_path}"
+            sub_res = session.get(sub_api_url, timeout=15, proxies=region_proxies)
             if sub_res.status_code == 200:
                 for cap in sub_res.json().get("data", {}).get("captions", []):
                     if cap.get("url") and cap.get("lan"): all_subtitles.append({"lang": cap["lan"], "url": cap["url"]})
