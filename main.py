@@ -344,6 +344,16 @@ def _build_moviebox_session():
         "sec-ch-ua-platform": '"Windows"',
         "x-client-info": '{"timezone":"Africa/Casablanca"}',
     })
+
+    # Route ALL MovieBox requests through a residential proxy to bypass the
+    # 403 that datacenter IPs (Render/Northflank/etc.) get from Cloudflare.
+    # Set the env var MOVIEBOX_PROXY, e.g.:
+    #   http://user:pass@host:port  or  socks5://user:pass@host:port
+    proxy = os.environ.get("MOVIEBOX_PROXY", "").strip()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+        sys.stderr.write("[MOVIEBOX] using residential proxy.\n")
+
     return session
 
 
