@@ -489,12 +489,17 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         try:
             detail_api_url = "%s/wefeed-h5api-bff/detail?detailPath=%s" % (host, detail_path)
             detail_res = session.get(detail_api_url, headers=api_headers, timeout=20)
+            sys.stderr.write("[MOVIEBOX] detail %s -> %s\n" % (host, detail_res.status_code))
             detail_res.raise_for_status()
+            # Reuse any cookies the backend hands us (critical for the play call).
+            if detail_res.cookies:
+                session.cookies.update(detail_res.cookies)
             subject_id = detail_res.json().get("data", {}).get("subject", {}).get("subjectId")
             if subject_id:
                 break
         except Exception as e:
             detail_err = e
+            sys.stderr.write("[MOVIEBOX] detail %s failed: %s\n" % (host, e))
             continue
     if not subject_id:
         return {"status": "error", "message": "MovieBox: Failed to get subjectId. %s" % detail_err}
@@ -511,6 +516,7 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         try:
             play_api_url = "%s/wefeed-h5api-bff/subject/play?subjectId=%s&se=%s&ep=%s&detailPath=%s" % (host, subject_id, se, ep, detail_path)
             play_res = session.get(play_api_url, headers=play_headers, timeout=20)
+            sys.stderr.write("[MOVIEBOX] play %s -> %s\n" % (host, play_res.status_code))
             play_res.raise_for_status()
             data = play_res.json().get("data", {})
 
