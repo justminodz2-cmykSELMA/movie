@@ -331,9 +331,8 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         sys.stderr.write("[*] MOVIEBOX-LOG: Region proxy configured for play/detail API.\n")
 
     # 🌟 التوكن الذي أرسلته أنت والذي ثبت نجاحه
-    fake_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjIwNjU1NTczNTQ1OTgyNTUwNTYsImF0cCI6MywiZXh0IjoiMTc4Mjc4NDYxNSIsImV4cCI6MTc5MDU2MDYxNSwiaWF0IjoxNzgyNzg0MzE1fQ.Och1r5a1XzVdWKHgoo87wFGRcGeBN3XY-Qa1w6dzIGk"
-    
-    # الهيدرز المطابقة تماماً للمتصفح الحقيقي لتجاوز الحظر
+  
+    # الهيدرز بدون توكن ثابت لتجنب مشكلة الـ Limit (محاكاة المتصفح المخفي)
     api_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
@@ -344,11 +343,15 @@ def scrape_moviebox(query, media_type, season_num, episode_num):
         'sec-ch-ua': '"Chromium";v="142", "Not(A:Brand";v="24", "Google Chrome";v="142"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
-        'x-client-info': '{"timezone":"Africa/Casablanca"}',
-        'x-user': f'{{"token":"{fake_token}","userId":"2065557354598255056","userType":0,"appType":3}}',
-        'Cookie': f'token={fake_token}; mb_token="{fake_token}"'
+        'x-client-info': '{"timezone":"Africa/Casablanca"}'
     }
     session.headers.update(api_headers)
+
+    # 🌟 خطوة المتصفح المخفي: زيارة صامتة للصفحة الرئيسية لجلب Cookies جديدة ونظيفة (Guest Session)
+    try:
+        session.get("https://netfilm.world/", timeout=15, proxies=region_proxies)
+    except Exception:
+        pass
 
     # 1. البحث
     search_url = f"https://moviebox.ph/web/searchResult?keyword={urllib.parse.quote_plus(query)}"
